@@ -75,22 +75,49 @@ typedef struct {
     ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
+typedef struct {
+    char *str;
+    int id;
+} TokenIndex;
+
+typedef struct {
+    char** vocab;
+    float* vocab_scores;
+    TokenIndex *sorted_vocab;
+    int vocab_size;
+    unsigned int max_token_length;
+    unsigned char byte_pieces[512]; // stores all single-byte strings
+} Tokenizer;
+
+typedef struct {
+    float prob;
+    int index;
+} ProbIndex; // struct used when sorting probabilities during top-p sampling
+
+typedef struct {
+    int vocab_size;
+    ProbIndex* probindex; // buffer used in top-p sampling
+    float temperature;
+    float topp;
+    unsigned long long rng_state;
+} Sampler;
+
+Tokenizer tokenizer;
+Sampler g_sampler;
+
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    s->x = calloc(p->dim, sizeof(float));
-    s->xb = calloc(p->dim, sizeof(float));
-    s->xb2 = calloc(p->dim, sizeof(float));
-    s->hb = calloc(p->hidden_dim, sizeof(float));
-    s->hb2 = calloc(p->hidden_dim, sizeof(float));
-    s->q = calloc(p->dim, sizeof(float));
-    s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
-    s->logits = calloc(p->vocab_size, sizeof(float));
-
     s->x = static_cast<float*>(calloc(p->dim, sizeof(float)));
-
+    s->xb = static_cast<float*>(calloc(p->dim, sizeof(float)));
+    s->xb2 = static_cast<float*>(calloc(p->dim, sizeof(float)));
+    s->hb = static_cast<float*>(calloc(p->hidden_dim, sizeof(float)));
+    s->hb2 = static_cast<float*>(calloc(p->hidden_dim, sizeof(float)));
+    s->q = static_cast<float*>(calloc(p->dim, sizeof(float)));
+    s->key_cache = static_cast<float*>(calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
+    s->value_cache = static_cast<float*>(calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
+    s->att = static_cast<float*>(calloc(p->n_heads * p->seq_len, sizeof(float)));
+    s->logits = static_cast<float*>(calloc(p->vocab_size, sizeof(float)));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
@@ -159,7 +186,7 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     // memory map the Transformer weights into the data pointer
     *fd = open(checkpoint, O_RDONLY); // open in read only mode
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+    *data = static_cast<float*>(mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0));
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
     memory_map_weights(weights, config, weights_ptr, shared_weights);
@@ -298,22 +325,17 @@ int popcount(uint8_t x) {
     return count;
 }
 
-void matmul(float* xout, uint8_t* x, uint8_t* w, int n, int d) {
-    float scale_x = calculateScale(x, n);
-    float scale_w = calculateScale(w, d * n);
-    float scale = scale_x * scale_w;
-
+void matmul(float* xout, float* x, float* w, int n, int d) {
+    // W (d,n) @ x (n,) -> xout (d,)
+    // by far the most amount of time is spent inside this little function
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
-        int val = 0;
-        for (int j = 0; j < n / 8; j++) {
-            uint8_t xnor_result = ~(x[j] ^ w[i * (n / 8) + j]);
-            val += popcount(xnor_result);
+        float val = 0.0f;
+        for (int j = 0; j < n; j++) {
+            val += w[i * n + j] * x[j];
         }
-
-        // 将计数转换为最终值
-        xout[i] = (val - ((n - val) * scale)); // 应用缩放因子
+        xout[i] = val;
     }
 }
 
@@ -453,25 +475,14 @@ float* forward(Transformer* transformer, int token, int pos) {
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
-typedef struct {
-    char *str;
-    int id;
-} TokenIndex;
 
-typedef struct {
-    char** vocab;
-    float* vocab_scores;
-    TokenIndex *sorted_vocab;
-    int vocab_size;
-    unsigned int max_token_length;
-    unsigned char byte_pieces[512]; // stores all single-byte strings
-} Tokenizer;
 
 int compare_tokens(const void *a, const void *b) {
     return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
 
-void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
+void build_tokenizer(char* tokenizer_path, int vocab_size) {
+    Tokenizer* t = &tokenizer;
     // i should have written the vocab_size into the tokenizer file... sigh
     t->vocab_size = vocab_size;
     // malloc space to hold the scores and the strings
@@ -534,7 +545,7 @@ void safe_printf(char *piece) {
 int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     // efficiently find the perfect match for str in vocab, return its index or -1 if not found
     TokenIndex tok = { .str = str }; // acts as the key to search for
-    TokenIndex *res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
+    TokenIndex *res = static_cast<TokenIndex*>(bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens));
     return res != NULL ? res->id : -1;
 }
 
@@ -545,7 +556,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 
     if (t->sorted_vocab == NULL) {
         // lazily malloc and sort the vocabulary
-        t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+        t->sorted_vocab = static_cast<TokenIndex*>(malloc(t->vocab_size * sizeof(TokenIndex)));
         for (int i = 0; i < t->vocab_size; i++) {
             t->sorted_vocab[i].str = t->vocab[i];
             t->sorted_vocab[i].id = i;
@@ -555,7 +566,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 
     // create a temporary buffer that will store merge candidates of always two consecutive tokens
     // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
-    char* str_buffer = malloc((t->max_token_length*2 +1 +2) * sizeof(char));
+    char* str_buffer = static_cast<char*>(malloc((t->max_token_length*2 +1 +2) * sizeof(char)));
     size_t str_len = 0;
 
     // start at 0 tokens
@@ -663,18 +674,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 // The Sampler, which takes logits and returns a sampled token
 // sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
 
-typedef struct {
-    float prob;
-    int index;
-} ProbIndex; // struct used when sorting probabilities during top-p sampling
 
-typedef struct {
-    int vocab_size;
-    ProbIndex* probindex; // buffer used in top-p sampling
-    float temperature;
-    float topp;
-    unsigned long long rng_state;
-} Sampler;
 
 int sample_argmax(float* probabilities, int n) {
     // return the index that has the highest probability
@@ -753,13 +753,14 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
     return probindex[last_idx].index; // in case of rounding errors
 }
 
-void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
+void build_sampler(int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
+    Sampler* sampler = &g_sampler;
     sampler->vocab_size = vocab_size;
     sampler->temperature = temperature;
     sampler->topp = topp;
     sampler->rng_state = rng_seed;
     // buffer only used with nucleus sampling; may not need but it's ~small
-    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+    sampler->probindex = static_cast<ProbIndex*>(malloc(sampler->vocab_size * sizeof(ProbIndex)));
 }
 
 void free_sampler(Sampler* sampler) {
@@ -815,14 +816,16 @@ long time_in_ms() {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
+void generate(Transformer *transformer, char *prompt, int steps) {
+    Sampler *sampler = &g_sampler;
+    Tokenizer *T = &tokenizer;
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
     // encode the (string) prompt into tokens sequence
     int num_prompt_tokens = 0;
     int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
-    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+    encode(T, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);
@@ -852,7 +855,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         if (next == 1) { break; }
 
         // print the token as string, decode it with the Tokenizer object
-        char* piece = decode(tokenizer, token, next);
+        char* piece = decode(T, token, next);
         safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
         fflush(stdout);
         token = next;
@@ -888,9 +891,9 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 // python reference and that seemed ok, but this was not thoroughly tested and
 // is not safely implemented, it's more a proof of concept atm.
 
-void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
-          char *cli_user_prompt, char *cli_system_prompt, int steps) {
-
+void chat(Transformer *transformer, char *cli_user_prompt, char *cli_system_prompt, int steps) {
+    Sampler *sampler = &g_sampler;
+    Tokenizer *T = &tokenizer;
     // buffers for reading the system prompt and user prompt from stdin
     // you'll notice they are soomewhat haphazardly and unsafely set atm
     char system_prompt[512];
@@ -938,7 +941,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
                 sprintf(rendered_prompt, user_template, user_prompt);
             }
             // encode the rendered prompt into tokens
-            encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+            encode(T, rendered_prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
             user_idx = 0; // reset the user index
             user_turn = 0;
             printf("Assistant: ");
@@ -962,7 +965,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
 
         if (user_idx >= num_prompt_tokens && next != 2) {
             // the Assistant is responding, so print its output
-            char* piece = decode(tokenizer, token, next);
+            char* piece = decode(T, token, next);
             safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
             fflush(stdout);
         }
@@ -991,6 +994,58 @@ void error_usage() {
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
     exit(EXIT_FAILURE);
 }
+
+
+void goLLM() {
+        // default parameters
+    char *checkpoint_path = "stories42M.bin";  // e.g. out/model.bin
+    char *tokenizer_path = "tokenizer.bin";
+    float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
+    float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
+    int steps = 256;            // number of steps to run for
+    char *prompt = "hello word";        // prompt string
+    unsigned long long rng_seed = 0; // seed rng with time by default
+    char *mode = "generate";    // generate|chat
+    char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
+
+// parameter validation/overrides
+    if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
+    if (temperature < 0.0) temperature = 0.0;
+    if (topp < 0.0 || 1.0 < topp) topp = 0.9;
+    if (steps < 0) steps = 0;
+
+    // build the Transformer via the model .bin file
+    Transformer transformer;
+    build_transformer(&transformer, checkpoint_path);
+    if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
+
+    // build the Tokenizer via the tokenizer .bin file
+    build_tokenizer(tokenizer_path, transformer.config.vocab_size);
+
+    // build the Sampler
+    build_sampler(transformer.config.vocab_size, temperature, topp, rng_seed);
+
+    // run!
+    if (strcmp(mode, "generate") == 0) {
+        generate(&transformer, prompt, steps);
+    } else if (strcmp(mode, "chat") == 0) {
+        chat(&transformer, prompt, system_prompt, steps);
+    } else {
+        fprintf(stderr, "unknown mode: %s\n", mode);
+        error_usage();
+    }
+
+    // memory and file handles cleanup
+    free_sampler(&g_sampler);
+    free_tokenizer(&tokenizer);
+    free_transformer(&transformer);
+}
+
+// void free(transformer) {
+//     free_sampler(&g_sampler);
+//     free_tokenizer(&tokenizer);
+//     free_transformer(&transformer);
+// }
 
 int main(int argc, char *argv[]) {
 
@@ -1037,17 +1092,17 @@ int main(int argc, char *argv[]) {
 
     // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer;
-    build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+    build_tokenizer(tokenizer_path, transformer.config.vocab_size);
 
     // build the Sampler
     Sampler sampler;
-    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
+    build_sampler(transformer.config.vocab_size, temperature, topp, rng_seed);
 
     // run!
     if (strcmp(mode, "generate") == 0) {
-        generate(&transformer, &tokenizer, &sampler, prompt, steps);
+        generate(&transformer, prompt, steps);
     } else if (strcmp(mode, "chat") == 0) {
-        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+        chat(&transformer, prompt, system_prompt, steps);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();
